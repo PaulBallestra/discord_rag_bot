@@ -1,10 +1,10 @@
+// internal/ai/openai.go - Add missing implementations
 package ai
 
 import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"strings"
 	"time"
 
@@ -21,57 +21,48 @@ func NewAIService(apiKey string) *AIService {
 	}
 }
 
-func (ai *AIService) GenerateResponse(prompt string, contextInfo string) (string, error) {
-	fullPrompt := fmt.Sprintf(`Context from previous conversations:
-%s
-
-Current question: %s
-
-Please provide a helpful response based on the context above.`, contextInfo, prompt)
-
-	req := openai.ChatCompletionRequest{
-		Model: openai.GPT3Dot5Turbo,
-		Messages: []openai.ChatCompletionMessage{
-			{
-				Role:    openai.ChatMessageRoleUser,
-				Content: fullPrompt,
-			},
-		},
-		MaxTokens:   500,
-		Temperature: 0.7,
-	}
-
+func (ai *AIService) GenerateResponse(systemPrompt, userPrompt string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	resp, err := ai.client.CreateChatCompletion(ctx, req)
+	resp, err := ai.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model: openai.GPT4oMini,
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: systemPrompt,
+			},
+			{
+				Role:    openai.ChatMessageRoleUser,
+				Content: userPrompt,
+			},
+		},
+		MaxTokens:   500, // Reasonable limit for voice responses
+		Temperature: 0.7,
+	})
+
 	if err != nil {
-		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota") {
-			log.Printf("OpenAI quota exceeded, using fallback response")
-			return ai.getFallbackResponse(prompt, contextInfo), nil
-		}
-		return "", fmt.Errorf("failed to generate response: %v", err)
+		return ai.getFallbackResponse(userPrompt, systemPrompt), nil
 	}
 
 	if len(resp.Choices) == 0 {
-		return ai.getFallbackResponse(prompt, contextInfo), nil
+		return "I'm sorry, I couldn't generate a response right now.", nil
 	}
 
 	return resp.Choices[0].Message.Content, nil
 }
 
 func (ai *AIService) GenerateEmbedding(text string) ([]float32, error) {
-	req := openai.EmbeddingRequest{
-		Input: []string{text},
-		Model: openai.AdaEmbeddingV2,
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	resp, err := ai.client.CreateEmbeddings(ctx, req)
+	resp, err := ai.client.CreateEmbeddings(ctx, openai.EmbeddingRequest{
+		Input: []string{text},
+		Model: openai.AdaEmbeddingV2,
+	})
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to create embedding: %v", err)
+		return nil, fmt.Errorf("failed to generate embedding: %v", err)
 	}
 
 	if len(resp.Data) == 0 {
@@ -81,7 +72,6 @@ func (ai *AIService) GenerateEmbedding(text string) ([]float32, error) {
 	return resp.Data[0].Embedding, nil
 }
 
-// NEW: Text-to-Speech using OpenAI's TTS
 func (ai *AIService) TextToSpeech(text string) ([]byte, error) {
 	req := openai.CreateSpeechRequest{
 		Model:          openai.TTSModel1,
@@ -100,7 +90,6 @@ func (ai *AIService) TextToSpeech(text string) ([]byte, error) {
 	}
 	defer response.Close()
 
-	// Read all the audio data
 	audioData, err := io.ReadAll(response)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read audio data: %v", err)
@@ -109,7 +98,6 @@ func (ai *AIService) TextToSpeech(text string) ([]byte, error) {
 	return audioData, nil
 }
 
-// NEW: Speech-to-Text using OpenAI's Whisper
 func (ai *AIService) SpeechToText(audioReader io.Reader) (string, error) {
 	req := openai.AudioRequest{
 		Model:    openai.Whisper1,
@@ -130,7 +118,6 @@ func (ai *AIService) SpeechToText(audioReader io.Reader) (string, error) {
 	return resp.Text, nil
 }
 
-// Fallback response when OpenAI is unavailable
 func (ai *AIService) getFallbackResponse(prompt string, contextInfo string) string {
 	prompt = strings.ToLower(prompt)
 

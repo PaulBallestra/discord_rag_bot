@@ -337,7 +337,6 @@ func (h *BotHandler) logVoiceInteraction(guildID, channelID, userID, username, q
 		Response:  response,
 		ChannelID: channelID,
 		GuildID:   guildID,
-		IsVoice:   true,
 		Timestamp: time.Now(),
 	}
 
