@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -98,13 +100,42 @@ func (ai *AIService) TextToSpeech(text string) ([]byte, error) {
 	return audioData, nil
 }
 
+// Add this to your ai/openai.go file (or update the existing SpeechToText method)
 func (ai *AIService) SpeechToText(audioReader io.Reader) (string, error) {
+	// Create a temporary file to store the audio
+	tempFile, err := os.CreateTemp("", "speech-*.wav")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
+
+	// Copy audio data to temp file
+	if _, err := io.Copy(tempFile, audioReader); err != nil {
+		return "", fmt.Errorf("failed to write audio data: %v", err)
+	}
+	tempFile.Close()
+
+	// Verify file size
+	fileInfo, err := os.Stat(tempFile.Name())
+	if err != nil {
+		return "", fmt.Errorf("failed to get file info: %v", err)
+	}
+
+	log.Printf("Sending audio file to OpenAI: %d bytes", fileInfo.Size())
+
+	// Open file for reading
+	file, err := os.Open(tempFile.Name())
+	if err != nil {
+		return "", fmt.Errorf("failed to open temp file: %v", err)
+	}
+	defer file.Close()
+
+	// Create transcription request
 	req := openai.AudioRequest{
 		Model:    openai.Whisper1,
-		Reader:   audioReader,
-		Prompt:   "",
-		Format:   openai.AudioResponseFormatText,
-		Language: "en",
+		FilePath: tempFile.Name(),
+		Reader:   file,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

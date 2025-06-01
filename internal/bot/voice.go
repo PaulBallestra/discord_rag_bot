@@ -46,6 +46,7 @@ func NewVoiceManager(handler *BotHandler) *VoiceManager {
 	}
 }
 
+// Replace the JoinVoiceChannel function in voice.go
 func (vm *VoiceManager) JoinVoiceChannel(s *discordgo.Session, guildID, channelID, userID string) error {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
@@ -59,6 +60,7 @@ func (vm *VoiceManager) JoinVoiceChannel(s *discordgo.Session, guildID, channelI
 			existingConn.Connection.Disconnect()
 		}
 		delete(vm.connections, guildID)
+		time.Sleep(1 * time.Second) // Wait for cleanup
 	}
 
 	// Join voice channel
@@ -67,20 +69,26 @@ func (vm *VoiceManager) JoinVoiceChannel(s *discordgo.Session, guildID, channelI
 		return fmt.Errorf("failed to join voice channel: %v", err)
 	}
 
-	// Wait for the connection to be ready - Fixed for newer discordgo
-	if voiceConn.Ready {
-		log.Printf("Voice connection ready for guild %s", guildID)
-	} else {
-		// Wait a bit and check again
-		time.Sleep(2 * time.Second)
-		if !voiceConn.Ready {
+	// Wait for the connection to be ready with timeout
+	timeout := time.After(10 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
 			voiceConn.Disconnect()
-			return fmt.Errorf("voice connection not ready after timeout")
+			return fmt.Errorf("voice connection timeout")
+		case <-ticker.C:
+			if voiceConn.Ready {
+				log.Printf("Voice connection ready for guild %s", guildID)
+				goto ready
+			}
 		}
-		log.Printf("Voice connection ready for guild %s", guildID)
 	}
 
-	// Create opus decoder and encoder
+ready:
+	// Create opus decoder and encoder with error handling
 	decoder, err := gopus.NewDecoder(48000, 2)
 	if err != nil {
 		voiceConn.Disconnect()
@@ -92,6 +100,10 @@ func (vm *VoiceManager) JoinVoiceChannel(s *discordgo.Session, guildID, channelI
 		voiceConn.Disconnect()
 		return fmt.Errorf("failed to create encoder: %v", err)
 	}
+
+	// Set encoder bitrate for better quality
+	encoder.SetBitrate(96000)
+	log.Printf("Encoder bitrate set to 96000")
 
 	// Create context for this connection
 	ctx, cancel := context.WithCancel(context.Background())
@@ -290,24 +302,33 @@ func (vm *VoiceManager) listenForVoice(vc *VoiceConnection) {
 	}
 }
 
+// Replace the processVoicePacket function in voice.go
 func (vm *VoiceManager) processVoicePacket(vc *VoiceConnection, packet *discordgo.Packet) {
-	// Get bot's SSRC for comparison - Fixed type conversion
-	// botUserID := vc.Connection.UserID
+	// Skip empty or invalid packets
+	if packet == nil || packet.Opus == nil || len(packet.Opus) == 0 {
+		return
+	}
 
-	// Convert packet.SSRC to string or compare differently
-	// Since we can't easily get bot's SSRC, we'll use a different approach
-	// Skip packets if they're from known bot sources (this is a simplified check)
-	if packet.SSRC == 0 {
+	// Skip packets that are too small (likely invalid)
+	if len(packet.Opus) < 10 {
 		return
 	}
 
 	vc.mu.Lock()
 	defer vc.mu.Unlock()
 
-	// Decode Opus to PCM
+	// Try to decode Opus to PCM - handle errors gracefully
 	pcm, err := vc.decoder.Decode(packet.Opus, 960, false)
 	if err != nil {
-		log.Printf("Error decoding opus: %v", err)
+		// Don't log every invalid packet, just skip them
+		if !strings.Contains(err.Error(), "invalid packet") {
+			log.Printf("Error decoding opus: %v", err)
+		}
+		return
+	}
+
+	// Skip if PCM data is empty
+	if len(pcm) == 0 {
 		return
 	}
 
@@ -334,6 +355,7 @@ func (vm *VoiceManager) handleVoiceRecording(vc *VoiceConnection) {
 
 	lastBufferSize := 0
 	silenceCount := 0
+	maxRecordingTime := 300 // 30 seconds max
 
 	for {
 		select {
@@ -349,17 +371,19 @@ func (vm *VoiceManager) handleVoiceRecording(vc *VoiceConnection) {
 				lastBufferSize = currentSize
 			}
 
-			// 2 seconds of silence and some audio data
-			if silenceCount >= 20 && currentSize > 1000 {
+			// 2 seconds of silence and sufficient audio data (at least 16KB)
+			if silenceCount >= 20 && currentSize > 16000 {
 				vm.processRecordedAudio(vc)
 				return
 			}
 
-			// Maximum recording time of 30 seconds
-			if silenceCount >= 300 {
-				if currentSize > 1000 {
+			// Maximum recording time reached
+			if silenceCount >= maxRecordingTime {
+				if currentSize > 16000 {
+					log.Printf("Max recording time reached, processing %d bytes", currentSize)
 					vm.processRecordedAudio(vc)
 				} else {
+					log.Printf("Max recording time reached but insufficient audio data (%d bytes), discarding", currentSize)
 					vc.mu.Lock()
 					vc.AudioBuffer.Reset()
 					vc.IsRecording = false
@@ -367,7 +391,9 @@ func (vm *VoiceManager) handleVoiceRecording(vc *VoiceConnection) {
 				}
 				return
 			}
+
 		case <-vc.ctx.Done():
+			log.Printf("Voice recording cancelled for guild %s", vc.GuildID)
 			return
 		}
 	}
@@ -447,36 +473,54 @@ func (vm *VoiceManager) processVoiceToAI(vc *VoiceConnection, pcmData []byte) {
 	}
 }
 
+// Replace the pcmToWav function in voice.go
 func (vm *VoiceManager) pcmToWav(pcmData []byte) ([]byte, error) {
-	var buf bytes.Buffer
+	// Create temporary files
+	pcmFile, err := os.CreateTemp("", "voice-*.pcm")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp PCM file: %v", err)
+	}
+	defer os.Remove(pcmFile.Name())
+	defer pcmFile.Close()
 
-	sampleRate := uint32(48000)
-	channels := uint16(2)
-	bitsPerSample := uint16(16)
-	byteRate := sampleRate * uint32(channels) * uint32(bitsPerSample) / 8
-	blockAlign := channels * bitsPerSample / 8
-	dataSize := uint32(len(pcmData))
-	fileSize := dataSize + 36
+	wavFile, err := os.CreateTemp("", "voice-*.wav")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp WAV file: %v", err)
+	}
+	defer os.Remove(wavFile.Name())
+	defer wavFile.Close()
 
-	// RIFF header
-	buf.WriteString("RIFF")
-	binary.Write(&buf, binary.LittleEndian, fileSize)
-	buf.WriteString("WAVE")
+	// Write PCM data
+	if _, err := pcmFile.Write(pcmData); err != nil {
+		return nil, fmt.Errorf("failed to write PCM data: %v", err)
+	}
+	pcmFile.Close()
 
-	// Format chunk
-	buf.WriteString("fmt ")
-	binary.Write(&buf, binary.LittleEndian, uint32(16))
-	binary.Write(&buf, binary.LittleEndian, uint16(1))
-	binary.Write(&buf, binary.LittleEndian, channels)
-	binary.Write(&buf, binary.LittleEndian, sampleRate)
-	binary.Write(&buf, binary.LittleEndian, byteRate)
-	binary.Write(&buf, binary.LittleEndian, blockAlign)
-	binary.Write(&buf, binary.LittleEndian, bitsPerSample)
+	// Convert PCM to proper WAV using FFmpeg
+	cmd := exec.Command("ffmpeg",
+		"-f", "s16le", // Input format: 16-bit signed little-endian
+		"-ar", "48000", // Sample rate: 48kHz
+		"-ac", "2", // Channels: stereo
+		"-i", pcmFile.Name(), // Input file
+		"-acodec", "pcm_s16le", // Audio codec
+		"-ar", "16000", // Resample to 16kHz for OpenAI
+		"-ac", "1", // Convert to mono for OpenAI
+		"-y",           // Overwrite output
+		wavFile.Name()) // Output file
 
-	// Data chunk
-	buf.WriteString("data")
-	binary.Write(&buf, binary.LittleEndian, dataSize)
-	buf.Write(pcmData)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
-	return buf.Bytes(), nil
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg conversion failed: %v, stderr: %s", err, stderr.String())
+	}
+
+	// Read the WAV file
+	wavData, err := os.ReadFile(wavFile.Name())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read WAV file: %v", err)
+	}
+
+	log.Printf("Generated WAV file: %d bytes", len(wavData))
+	return wavData, nil
 }
