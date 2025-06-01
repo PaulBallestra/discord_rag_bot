@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -118,10 +119,8 @@ func (vm *VoiceManager) listenForVoice(vc *VoiceConnection) {
 }
 
 func (vm *VoiceManager) processVoicePacket(vc *VoiceConnection, packet *discordgo.Packet) {
-	// Only process packets from the user who requested the bot
-	if packet.SSRC != vc.Connection.OpusSend {
-		return
-	}
+	// We want to process all incoming voice packets, not just from the bot
+	// Removed the SSRC check that was filtering out user voice
 
 	vc.mu.Lock()
 	defer vc.mu.Unlock()
@@ -215,7 +214,7 @@ func (vm *VoiceManager) processVoiceToAI(vc *VoiceConnection, pcmData []byte) {
 	}
 
 	// Send to speech-to-text
-	text, err := vm.handler.rag.ai.SpeechToText(bytes.NewReader(wavData))
+	text, err := vm.handler.rag.AI.SpeechToText(bytes.NewReader(wavData))
 	if err != nil {
 		log.Printf("Error in speech-to-text: %v", err)
 		return
@@ -270,7 +269,7 @@ func (vm *VoiceManager) processVoiceToAI(vc *VoiceConnection, pcmData []byte) {
 
 func (vm *VoiceManager) speakResponse(vc *VoiceConnection, text string) error {
 	// Generate speech from text
-	audioData, err := vm.handler.rag.ai.TextToSpeech(text)
+	audioData, err := vm.handler.rag.AI.TextToSpeech(text)
 	if err != nil {
 		return fmt.Errorf("error generating speech: %v", err)
 	}
@@ -297,42 +296,102 @@ func (vm *VoiceManager) speakResponse(vc *VoiceConnection, text string) error {
 }
 
 func (vm *VoiceManager) convertToDCA(inputFile, outputFile string) error {
-	// Use FFmpeg to convert to DCA
+	// Use FFmpeg to convert to DCA format
 	cmd := exec.Command("ffmpeg",
 		"-i", inputFile,
 		"-f", "s16le",
 		"-ar", "48000",
 		"-ac", "2",
-		outputFile)
+		"-c:a", "pcm_s16le",
+		"pipe:1")
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	// Create DCA encoder that writes to file
+	output, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("error creating output file: %v", err)
+	}
+	defer output.Close()
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("error getting stdout pipe: %v", err)
+	}
+
+	// Start FFmpeg
+	err = cmd.Start()
 	if err != nil {
 		return fmt.Errorf("ffmpeg error: %v, stderr: %s", err, stderr.String())
+	}
+
+	// Create DCA encoder
+	opts := dca.StdEncodeOptions
+	opts.RawOutput = true
+	opts.Bitrate = 128
+	opts.Application = "audio"
+
+	encoder, err := dca.EncodeMem(stdout, opts)
+	if err != nil {
+		cmd.Process.Kill()
+		return fmt.Errorf("error creating DCA encoder: %v", err)
+	}
+	defer encoder.Cleanup()
+
+	// Copy encoder output to file
+	_, err = io.Copy(output, encoder)
+	if err != nil {
+		return fmt.Errorf("error writing DCA data: %v", err)
+	}
+
+	// Wait for FFmpeg to finish
+	err = cmd.Wait()
+	if err != nil {
+		return fmt.Errorf("ffmpeg wait error: %v, stderr: %s", err, stderr.String())
 	}
 
 	return nil
 }
 
 func (vm *VoiceManager) playAudioFile(vc *discordgo.VoiceConnection, filename string) error {
-	// Create DCA session
-	session, err := dca.EncodeFile(filename, dca.StdEncodeOptions)
+	// Open the DCA file
+	file, err := os.Open(filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("error opening DCA file: %v", err)
 	}
-	defer session.Cleanup()
+	defer file.Close()
+
+	// Create a new decoder
+	decoder := dca.NewDecoder(file)
 
 	// Start speaking
 	vc.Speaking(true)
 	defer vc.Speaking(false)
 
-	// Send audio data
-	done := make(chan error)
-	dca.NewStream(session, vc, done)
+	// Create a buffer for audio data
+	frameBuffer := make([][]byte, 0)
 
-	return <-done
+	// Read all frames
+	for {
+		frame, err := decoder.OpusFrame()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("error decoding opus frame: %v", err)
+		}
+		frameBuffer = append(frameBuffer, frame)
+	}
+
+	// Play frames with correct timing
+	for _, frame := range frameBuffer {
+		vc.OpusSend <- frame
+		// Sleep for the frame duration (20ms)
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	return nil
 }
 
 func (vm *VoiceManager) pcmToWav(pcmData []byte) ([]byte, error) {

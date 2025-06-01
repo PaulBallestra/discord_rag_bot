@@ -12,6 +12,10 @@ type AIService struct {
 	client *openai.Client
 }
 
+func (ai *AIService) GenerateResponse(systemPrompt string, userPrompt string) (any, any) {
+	panic("unimplemented")
+}
+
 func NewAIService(apiKey string) *AIService {
 	return &AIService{
 		client: openai.NewClient(apiKey),

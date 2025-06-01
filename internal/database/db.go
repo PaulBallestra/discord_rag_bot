@@ -1,4 +1,4 @@
-// internal/database/db.go
+// internal/database/db.go - Updated SearchSimilarMessages method
 package database
 
 import (
@@ -15,57 +15,70 @@ type DB struct {
 }
 
 func NewDB(host, user, password, dbname string, port int) (*DB, error) {
-	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%d sslmode=disable TimeZone=UTC",
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%d sslmode=disable",
 		host, user, password, dbname, port)
 
-	gormDB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return nil, err
 	}
 
 	// Enable pgvector extension
-	if err := gormDB.Exec("CREATE EXTENSION IF NOT EXISTS vector").Error; err != nil {
-		return nil, err
-	}
+	db.Exec("CREATE EXTENSION IF NOT EXISTS vector")
 
 	// Auto migrate
-	if err := gormDB.AutoMigrate(
+	err = db.AutoMigrate(
 		&models.DiscordMessage{},
 		&models.BotInteraction{},
 		&models.ConversationContext{},
-	); err != nil {
+	)
+	if err != nil {
 		return nil, err
 	}
 
-	return &DB{gormDB}, nil
+	return &DB{db}, nil
 }
 
-func (db *DB) StoreMessage(msg *models.DiscordMessage) error {
-	return db.FirstOrCreate(msg, models.DiscordMessage{MessageID: msg.MessageID}).Error
-}
-
+// Fixed method signature and implementation
 func (db *DB) SearchSimilarMessages(embedding []float32, guildID string, limit int) ([]models.DiscordMessage, error) {
 	var messages []models.DiscordMessage
 
 	// Convert to pgvector format
 	vector := pgvector.NewVector(embedding)
 
-	err := db.Where("guild_id = ?", guildID).
-		Order("embedding <-> ?", vector).
-		Limit(limit).
-		Find(&messages).Error
+	// Use raw SQL for vector similarity search
+	query := `
+        SELECT id, message_id, content, author, username, channel_id, channel_name, 
+               guild_id, guild_name, timestamp, embedding, created_at
+        FROM discord_messages 
+        WHERE guild_id = ? 
+        ORDER BY embedding <-> ? 
+        LIMIT ?`
 
+	err := db.Raw(query, guildID, vector, limit).Scan(&messages).Error
 	return messages, err
 }
 
-func (db *DB) GetRecentMessages(guildID, channelID string, limit int) ([]models.DiscordMessage, error) {
+// Alternative method using GORM's native methods (if the above doesn't work)
+func (db *DB) SearchSimilarMessagesAlternative(embedding []float32, guildID string, limit int) ([]models.DiscordMessage, error) {
 	var messages []models.DiscordMessage
 
-	query := db.Where("guild_id = ?", guildID)
-	if channelID != "" {
-		query = query.Where("channel_id = ?", channelID)
-	}
+	// Convert to pgvector format
+	vector := pgvector.NewVector(embedding)
 
-	err := query.Order("timestamp DESC").Limit(limit).Find(&messages).Error
+	// Use DB.Raw for the vector operation
+	subQuery := db.Model(&models.DiscordMessage{}).
+		Where("guild_id = ?", guildID).
+		Select("*, embedding <-> ? as distance", vector).
+		Order("distance").
+		Limit(limit)
+
+	err := subQuery.Find(&messages).Error
 	return messages, err
+}
+
+// Method to store message with embedding
+func (db *DB) CreateMessageWithEmbedding(message *models.DiscordMessage, embedding []float32) error {
+	message.Embedding = pgvector.NewVector(embedding)
+	return db.Create(message).Error
 }

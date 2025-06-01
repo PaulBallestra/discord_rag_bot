@@ -131,19 +131,24 @@ func (h *BotHandler) logVoiceInteraction(guildID, channelID, userID, username, q
 }
 
 func (h *BotHandler) storeMessage(m *discordgo.MessageCreate) {
+	if m.Content == "" || len(m.Content) < 10 {
+		return // Skip empty or very short messages
+	}
+
+	// Get channel and guild info
 	channel, err := h.session.Channel(m.ChannelID)
 	if err != nil {
-		log.Printf("Error getting channel: %v", err)
+		log.Printf("Error getting channel info: %v", err)
 		return
 	}
 
 	guild, err := h.session.Guild(m.GuildID)
 	if err != nil {
-		log.Printf("Error getting guild: %v", err)
+		log.Printf("Error getting guild info: %v", err)
 		return
 	}
 
-	msg := &models.DiscordMessage{
+	message := &models.DiscordMessage{
 		MessageID:   m.ID,
 		Content:     m.Content,
 		Author:      m.Author.ID,
@@ -155,8 +160,10 @@ func (h *BotHandler) storeMessage(m *discordgo.MessageCreate) {
 		Timestamp:   m.Timestamp,
 	}
 
-	if err := h.rag.ProcessAndStoreMessage(msg); err != nil {
-		log.Printf("Error storing message: %v", err)
+	// Use the new method that handles embeddings
+	err = h.rag.StoreMessageWithEmbedding(message)
+	if err != nil {
+		log.Printf("Error storing message with embedding: %v", err)
 	}
 }
 
