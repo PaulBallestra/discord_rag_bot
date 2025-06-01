@@ -53,19 +53,19 @@ func (h *BotHandler) OnMessageCreate(s *discordgo.Session, m *discordgo.MessageC
 	go h.storeMessage(m)
 
 	// Check for voice commands
-	if strings.HasPrefix(m.Content, "!join") || strings.Contains(m.Content, "join voice") {
+	if strings.HasPrefix(m.Content, "/join") || strings.Contains(m.Content, "join voice") {
 		h.handleJoinVoiceCommand(s, m)
 		return
 	}
 
-	if strings.HasPrefix(m.Content, "!leave") || strings.Contains(m.Content, "leave voice") {
+	if strings.HasPrefix(m.Content, "/leave") || strings.Contains(m.Content, "leave voice") {
 		h.handleLeaveVoiceCommand(s, m)
 		return
 	}
 
 	// Check if bot is mentioned or DM for text chat
 	botMentioned := strings.Contains(m.Content, "<@"+h.botID+">") ||
-		strings.HasPrefix(m.Content, "!ai ") ||
+		strings.HasPrefix(m.Content, "/ai ") ||
 		m.GuildID == "" // DM
 
 	if botMentioned {
@@ -170,7 +170,7 @@ func (h *BotHandler) storeMessage(m *discordgo.MessageCreate) {
 func (h *BotHandler) handleAIQuery(s *discordgo.Session, m *discordgo.MessageCreate) {
 	// Clean the query
 	query := strings.ReplaceAll(m.Content, "<@"+h.botID+">", "")
-	query = strings.ReplaceAll(query, "!ai ", "")
+	query = strings.ReplaceAll(query, "/ai ", "")
 	query = strings.TrimSpace(query)
 
 	if query == "" {

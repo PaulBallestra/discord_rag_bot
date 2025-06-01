@@ -67,7 +67,7 @@ Guidelines:
 		return "", fmt.Errorf("failed to generate AI response: %v", err)
 	}
 
-	return response.(string), nil
+	return response, nil
 }
 
 // StoreMessageWithEmbedding stores a message and generates its embedding

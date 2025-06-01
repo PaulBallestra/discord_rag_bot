@@ -68,8 +68,8 @@ func main() {
 
 	log.Println("🎤 Discord Voice RAG Bot is running!")
 	log.Println("Commands:")
-	log.Println("  !join - Join your voice channel")
-	log.Println("  !leave - Leave voice channel")
+	log.Println("  /join - Join your voice channel")
+	log.Println("  /leave - Leave voice channel")
 	log.Println("  @bot <message> - Text chat with AI")
 	log.Println("  Just talk when bot is in voice channel!")
 

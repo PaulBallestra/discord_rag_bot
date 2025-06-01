@@ -8,29 +8,6 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
-// GenerateEmbedding creates a vector embedding for the given text
-func (ai *AIService) GenerateEmbedding(text string) ([]float32, error) {
-	if text == "" {
-		return nil, fmt.Errorf("empty text provided for embedding")
-	}
-
-	req := openai.EmbeddingRequest{
-		Input: []string{text},
-		Model: openai.AdaEmbeddingV2, // text-embedding-ada-002
-	}
-
-	resp, err := ai.client.CreateEmbeddings(context.Background(), req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create embedding: %v", err)
-	}
-
-	if len(resp.Data) == 0 {
-		return nil, fmt.Errorf("no embedding data returned")
-	}
-
-	return resp.Data[0].Embedding, nil
-}
-
 // GenerateEmbeddings creates vector embeddings for multiple texts
 func (ai *AIService) GenerateEmbeddings(texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
