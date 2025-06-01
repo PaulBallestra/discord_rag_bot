@@ -64,7 +64,7 @@ func (vm *VoiceManager) JoinVoiceChannel(s *discordgo.Session, guildID, channelI
 	}
 
 	// Join the voice channel
-	vc, err := s.ChannelVoiceJoin(guildID, channelID, false, true)
+	vc, err := s.ChannelVoiceJoin(guildID, channelID, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to join voice channel: %v", err)
 	}
@@ -227,73 +227,63 @@ func (vm *VoiceManager) processVoiceToAI(vc *VoiceConnection, pcmData []byte) {
 
 	log.Printf("Transcribed text: %s", text)
 
-	// Get guild info for context
-	guild, err := vm.handler.session.Guild(vc.GuildID)
-	if err != nil {
-		log.Printf("Error getting guild: %v", err)
-		return
-	}
-
-	// Get user info
-	user, err := vm.handler.session.User(vc.UserId)
-	if err != nil {
-		log.Printf("Error getting user: %v", err)
-		return
-	}
-
-	// Generate AI response using RAG
+	// Get relevant context for RAG
 	context, err := vm.handler.rag.SearchRelevantContext(text, vc.GuildID, 5)
 	if err != nil {
 		log.Printf("Error getting context: %v", err)
 		return
 	}
 
-	response, err := vm.handler.rag.GenerateResponse(text, context, user.Username, guild.Name)
+	// Generate AI response
+	response, err := vm.handler.rag.GenerateResponse(text, context, "User", "")
 	if err != nil {
-		log.Printf("Error generating AI response: %v", err)
+		log.Printf("Error generating response: %v", err)
 		return
 	}
 
-	log.Printf("AI Response: %s", response)
+	// Log the interaction
+	vm.handler.logVoiceInteraction(vc.GuildID, vc.ChannelID, vc.UserId, "User", text, response)
 
-	// Convert response to speech and play
-	err = vm.speakResponse(vc, response)
+	// Generate TTS audio
+	ttsAudio, err := vm.handler.rag.AI.TextToSpeech(response)
 	if err != nil {
-		log.Printf("Error speaking response: %v", err)
+		log.Printf("Error generating TTS audio: %v", err)
 		return
 	}
 
-	// Log the voice interaction
-	vm.handler.logVoiceInteraction(vc.GuildID, vc.ChannelID, vc.UserId, user.Username, text, response)
+	// Send the TTS audio to the voice channel
+	if err := vm.SendAudio(vc, ttsAudio); err != nil {
+		log.Printf("Error sending audio: %v", err)
+	}
 }
 
-func (vm *VoiceManager) speakResponse(vc *VoiceConnection, text string) error {
-	// Generate speech from text
-	audioData, err := vm.handler.rag.AI.TextToSpeech(text)
-	if err != nil {
-		return fmt.Errorf("error generating speech: %v", err)
-	}
+// func (vm *VoiceManager) speakResponse(vc *VoiceConnection, text string) error {
+// 	// Generate speech from text
+// 	audioData, err := vm.handler.rag.AI.TextToSpeech(text)
+// 	if err != nil {
+// 		return fmt.Errorf("error generating speech: %v", err)
+// 	}
 
-	// Save audio to temporary file
-	tempFile := fmt.Sprintf("/tmp/tts_%d.mp3", time.Now().UnixNano())
-	err = os.WriteFile(tempFile, audioData, 0644)
-	if err != nil {
-		return fmt.Errorf("error saving audio file: %v", err)
-	}
-	defer os.Remove(tempFile)
+// 	// Save audio to temporary file
+// 	tempFile := fmt.Sprintf("/tmp/tts_%d.mp3", time.Now().UnixNano())
+// 	err = os.WriteFile(tempFile, audioData, 0644)
+// 	if err != nil {
+// 		return fmt.Errorf("error saving audio file: %v", err)
+// 	}
+// 	defer os.Remove(tempFile)
 
-	// Convert MP3 to DCA format for Discord
-	dcaFile := fmt.Sprintf("/tmp/tts_%d.dca", time.Now().UnixNano())
-	defer os.Remove(dcaFile)
+// 	// Convert MP3 to DCA format for Discord
+// 	dcaFile := fmt.Sprintf("/tmp/tts_%d.dca", time.Now().UnixNano())
+// 	defer os.Remove(dcaFile)
 
-	err = vm.convertToDCA(tempFile, dcaFile)
-	if err != nil {
-		return fmt.Errorf("error converting to DCA: %v", err)
-	}
+// 	err = vm.convertToDCA(tempFile, dcaFile)
+// 	if err != nil {
+// 		return fmt.Errorf("error converting to DCA: %v", err)
+// 	}
 
-	// Play the audio
-	return vm.playAudioFile(vc.Connection, dcaFile)
-}
+// 	// Play the audio
+// 	return vm.playAudioFile(vc.Connection, dcaFile)
+// }
 
 func (vm *VoiceManager) convertToDCA(inputFile, outputFile string) error {
 	// Use FFmpeg to convert to DCA format
@@ -395,39 +385,51 @@ func (vm *VoiceManager) playAudioFile(vc *discordgo.VoiceConnection, filename st
 }
 
 func (vm *VoiceManager) pcmToWav(pcmData []byte) ([]byte, error) {
-	// WAV header for 48kHz, 1 channel, 16-bit PCM
-	const (
-		sampleRate    = 48000
-		channels      = 1
-		bitsPerSample = 16
-	)
+	// Create a temporary file for PCM data
+	pcmFile, err := os.CreateTemp("", "pcm-*.raw")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary PCM file: %v", err)
+	}
+	defer os.Remove(pcmFile.Name())
+	defer pcmFile.Close()
 
-	dataSize := len(pcmData)
-	fileSize := 36 + dataSize
+	// Write PCM data to the file
+	if _, err := pcmFile.Write(pcmData); err != nil {
+		return nil, fmt.Errorf("failed to write PCM data: %v", err)
+	}
+	pcmFile.Close()
 
-	buf := new(bytes.Buffer)
+	// Create a temporary file for WAV output
+	wavFile, err := os.CreateTemp("", "wav-*.wav")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary WAV file: %v", err)
+	}
+	defer os.Remove(wavFile.Name())
+	defer wavFile.Close()
 
-	// RIFF header
-	buf.WriteString("RIFF")
-	binary.Write(buf, binary.LittleEndian, uint32(fileSize))
-	buf.WriteString("WAVE")
+	// Use FFmpeg to convert PCM to WAV
+	cmd := exec.Command("ffmpeg",
+		"-f", "s16le",
+		"-ar", "48000",
+		"-ac", "1",
+		"-i", pcmFile.Name(),
+		"-acodec", "pcm_s16le",
+		wavFile.Name())
 
-	// fmt chunk
-	buf.WriteString("fmt ")
-	binary.Write(buf, binary.LittleEndian, uint32(16)) // chunk size
-	binary.Write(buf, binary.LittleEndian, uint16(1))  // PCM format
-	binary.Write(buf, binary.LittleEndian, uint16(channels))
-	binary.Write(buf, binary.LittleEndian, uint32(sampleRate))
-	binary.Write(buf, binary.LittleEndian, uint32(sampleRate*channels*bitsPerSample/8)) // byte rate
-	binary.Write(buf, binary.LittleEndian, uint16(channels*bitsPerSample/8))            // block align
-	binary.Write(buf, binary.LittleEndian, uint16(bitsPerSample))
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
-	// data chunk
-	buf.WriteString("data")
-	binary.Write(buf, binary.LittleEndian, uint32(dataSize))
-	buf.Write(pcmData)
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg error: %v, stderr: %s", err, stderr.String())
+	}
 
-	return buf.Bytes(), nil
+	// Read the WAV file
+	wavData, err := os.ReadFile(wavFile.Name())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read WAV file: %v", err)
+	}
+
+	return wavData, nil
 }
 
 func (vm *VoiceManager) LeaveVoiceChannel(guildID string) error {
@@ -438,6 +440,42 @@ func (vm *VoiceManager) LeaveVoiceChannel(guildID string) error {
 		vc.Connection.Disconnect()
 		delete(vm.connections, guildID)
 		log.Printf("Left voice channel in guild %s", guildID)
+	}
+
+	return nil
+}
+
+// SendAudio sends audio data to the voice channel
+func (vm *VoiceManager) SendAudio(vc *VoiceConnection, audioData []byte) error {
+	if vc == nil || vc.Connection == nil {
+		return fmt.Errorf("no active voice connection")
+	}
+
+	// Create a temporary file for the audio data
+	tempFile, err := os.CreateTemp("", "tts-*.mp3")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file: %v", err)
+	}
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
+
+	// Write the audio data to the temporary file
+	if _, err := tempFile.Write(audioData); err != nil {
+		return fmt.Errorf("failed to write audio data: %v", err)
+	}
+	tempFile.Close()
+
+	// Convert to DCA format
+	dcaFile := tempFile.Name() + ".dca"
+	defer os.Remove(dcaFile)
+
+	if err := vm.convertToDCA(tempFile.Name(), dcaFile); err != nil {
+		return fmt.Errorf("failed to convert to DCA: %v", err)
+	}
+
+	// Play the audio file
+	if err := vm.playAudioFile(vc.Connection, dcaFile); err != nil {
+		return fmt.Errorf("failed to play audio: %v", err)
 	}
 
 	return nil

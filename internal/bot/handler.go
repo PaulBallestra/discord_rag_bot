@@ -215,10 +215,31 @@ func (h *BotHandler) handleAIInteraction(s *discordgo.Session, i *discordgo.Inte
 		return
 	}
 
-	// Send response
+	// Send response as text
 	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
 		Content: response,
 	})
+
+	// Check if we have a voice connection for this guild
+	h.voiceManager.mu.RLock()
+	vc, hasVoiceConnection := h.voiceManager.connections[i.GuildID]
+	h.voiceManager.mu.RUnlock()
+
+	// Generate and send voice response if in a voice channel
+	if hasVoiceConnection && vc != nil {
+		// Generate TTS audio and send to voice channel
+		ttsAudio, err := h.rag.AI.TextToSpeech(response)
+		if err != nil {
+			log.Printf("Error generating TTS audio: %v", err)
+		} else {
+			// Send the TTS audio to the voice channel in a goroutine
+			go func() {
+				if err := h.voiceManager.SendAudio(vc, ttsAudio); err != nil {
+					log.Printf("Error sending audio: %v", err)
+				}
+			}()
+		}
+	}
 
 	// Log interaction
 	interaction := &models.BotInteraction{
@@ -399,8 +420,32 @@ func (h *BotHandler) handleAIQuery(s *discordgo.Session, m *discordgo.MessageCre
 		return
 	}
 
-	// Send response
-	s.ChannelMessageSend(m.ChannelID, response)
+	// Check if we have a voice connection for this guild
+	h.voiceManager.mu.RLock()
+	vc, hasVoiceConnection := h.voiceManager.connections[m.GuildID]
+	h.voiceManager.mu.RUnlock()
+
+	// Send response based on connection type
+	if hasVoiceConnection && vc != nil {
+		// Send text response first
+		s.ChannelMessageSend(m.ChannelID, response)
+
+		// Generate TTS audio and send to voice channel
+		ttsAudio, err := h.rag.AI.TextToSpeech(response)
+		if err != nil {
+			log.Printf("Error generating TTS audio: %v", err)
+		} else {
+			// Send the TTS audio to the voice channel in a goroutine
+			go func() {
+				if err := h.voiceManager.SendAudio(vc, ttsAudio); err != nil {
+					log.Printf("Error sending audio: %v", err)
+				}
+			}()
+		}
+	} else {
+		// Just send text response
+		s.ChannelMessageSend(m.ChannelID, response)
+	}
 
 	// Log interaction
 	interaction := &models.BotInteraction{
