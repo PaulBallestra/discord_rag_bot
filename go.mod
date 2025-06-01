@@ -3,7 +3,7 @@ module discord-rag-bot
 go 1.24
 
 require (
-	github.com/bwmarrin/discordgo v0.29.0
+	github.com/bwmarrin/discordgo v0.27.1
 	github.com/joho/godotenv v1.5.1
 	github.com/pgvector/pgvector-go v0.3.0
 	github.com/sashabaranov/go-openai v1.40.1

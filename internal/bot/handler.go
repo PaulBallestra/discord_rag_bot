@@ -98,165 +98,6 @@ func (h *BotHandler) handleInteraction(s *discordgo.Session, i *discordgo.Intera
 	}
 }
 
-func (h *BotHandler) handleJoinInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	// Acknowledge the interaction immediately
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-	})
-
-	// Find the user's voice channel
-	guild, err := s.State.Guild(i.GuildID)
-	if err != nil {
-		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-			Content: "Error finding your voice channel.",
-		})
-		return
-	}
-
-	var voiceChannelID string
-	for _, vs := range guild.VoiceStates {
-		if vs.UserID == i.Member.User.ID {
-			voiceChannelID = vs.ChannelID
-			break
-		}
-	}
-
-	if voiceChannelID == "" {
-		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-			Content: "You need to be in a voice channel for me to join!",
-		})
-		return
-	}
-
-	err = h.voiceManager.JoinVoiceChannel(s, i.GuildID, voiceChannelID, i.Member.User.ID)
-	if err != nil {
-		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-			Content: fmt.Sprintf("Error joining voice channel: %v", err),
-		})
-		return
-	}
-
-	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-		Content: "🎤 Joined voice channel! You can now talk to me. I'm listening...",
-	})
-}
-
-func (h *BotHandler) handleLeaveInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	// Acknowledge the interaction immediately
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-	})
-
-	err := h.voiceManager.LeaveVoiceChannel(i.GuildID)
-	if err != nil {
-		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-			Content: fmt.Sprintf("Error leaving voice channel: %v", err),
-		})
-		return
-	}
-
-	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-		Content: "👋 Left voice channel!",
-	})
-}
-
-func (h *BotHandler) handleAIInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	// Acknowledge the interaction immediately
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-	})
-
-	// Get the question from options
-	options := i.ApplicationCommandData().Options
-	optionMap := make(map[string]*discordgo.ApplicationCommandInteractionDataOption, len(options))
-	for _, opt := range options {
-		optionMap[opt.Name] = opt
-	}
-
-	var query string
-	if option, ok := optionMap["question"]; ok {
-		query = option.StringValue()
-	}
-
-	if query == "" {
-		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-			Content: "Hi! How can I help you?",
-		})
-		return
-	}
-
-	// Get guild info
-	guild, err := s.Guild(i.GuildID)
-	if err != nil {
-		log.Printf("Error getting guild: %v", err)
-		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-			Content: "Sorry, I encountered an error while processing your request.",
-		})
-		return
-	}
-
-	// Get relevant context using RAG
-	context, err := h.rag.SearchRelevantContext(query, i.GuildID, 5)
-	if err != nil {
-		log.Printf("Error getting context: %v", err)
-		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-			Content: "Sorry, I encountered an error while searching for context.",
-		})
-		return
-	}
-
-	// Generate AI response
-	response, err := h.rag.GenerateResponse(query, context, i.Member.User.Username, guild.Name)
-	if err != nil {
-		log.Printf("Error generating response: %v", err)
-		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-			Content: "Sorry, I encountered an error while generating a response.",
-		})
-		return
-	}
-
-	// Send response as text
-	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-		Content: response,
-	})
-
-	// Check if we have a voice connection for this guild
-	h.voiceManager.mu.RLock()
-	vc, hasVoiceConnection := h.voiceManager.connections[i.GuildID]
-	h.voiceManager.mu.RUnlock()
-
-	// Generate and send voice response if in a voice channel
-	if hasVoiceConnection && vc != nil {
-		// Generate TTS audio and send to voice channel
-		ttsAudio, err := h.rag.AI.TextToSpeech(response)
-		if err != nil {
-			log.Printf("Error generating TTS audio: %v", err)
-		} else {
-			// Send the TTS audio to the voice channel in a goroutine
-			go func() {
-				if err := h.voiceManager.SendAudio(vc, ttsAudio); err != nil {
-					log.Printf("Error sending audio: %v", err)
-				}
-			}()
-		}
-	}
-
-	// Log interaction
-	interaction := &models.BotInteraction{
-		UserID:    i.Member.User.ID,
-		Username:  i.Member.User.Username,
-		Query:     query,
-		Response:  response,
-		ChannelID: i.ChannelID,
-		GuildID:   i.GuildID,
-		Timestamp: time.Now(),
-	}
-
-	if err := h.db.Create(interaction).Error; err != nil {
-		log.Printf("Error logging interaction: %v", err)
-	}
-}
-
 // Keeping the existing message handlers for backward compatibility
 
 func (h *BotHandler) OnMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
@@ -454,6 +295,156 @@ func (h *BotHandler) handleAIQuery(s *discordgo.Session, m *discordgo.MessageCre
 		Response:  response,
 		ChannelID: m.ChannelID,
 		GuildID:   m.GuildID,
+		Timestamp: time.Now(),
+	}
+
+	if err := h.db.Create(interaction).Error; err != nil {
+		log.Printf("Error logging interaction: %v", err)
+	}
+}
+
+// Add these missing functions to handler.go
+
+func (h *BotHandler) handleJoinInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Acknowledge the interaction immediately
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	})
+	if err != nil {
+		log.Printf("Error responding to interaction: %v", err)
+		return
+	}
+
+	// Find user's voice channel
+	guild, err := s.State.Guild(i.GuildID)
+	if err != nil {
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &[]string{"Error: Could not find guild"}[0],
+		})
+		return
+	}
+
+	var voiceChannelID string
+	for _, vs := range guild.VoiceStates {
+		if vs.UserID == i.Member.User.ID {
+			voiceChannelID = vs.ChannelID
+			break
+		}
+	}
+
+	if voiceChannelID == "" {
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &[]string{"❌ You need to be in a voice channel first!"}[0],
+		})
+		return
+	}
+
+	// Join voice channel
+	err = h.voiceManager.JoinVoiceChannel(s, i.GuildID, voiceChannelID, i.Member.User.ID)
+	if err != nil {
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &[]string{fmt.Sprintf("Error joining voice channel: %v", err)}[0],
+		})
+		return
+	}
+
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &[]string{"🎤 Joined voice channel! You can now talk to me. I'm listening..."}[0],
+	})
+}
+
+func (h *BotHandler) handleLeaveInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Acknowledge the interaction immediately
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	})
+	if err != nil {
+		log.Printf("Error responding to interaction: %v", err)
+		return
+	}
+
+	err = h.voiceManager.LeaveVoiceChannel(i.GuildID)
+	if err != nil {
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &[]string{fmt.Sprintf("Error leaving voice channel: %v", err)}[0],
+		})
+		return
+	}
+
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &[]string{"👋 Left voice channel!"}[0],
+	})
+}
+
+func (h *BotHandler) handleAIInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Acknowledge the interaction immediately
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	})
+	if err != nil {
+		log.Printf("Error responding to interaction: %v", err)
+		return
+	}
+
+	options := i.ApplicationCommandData().Options
+	if len(options) == 0 {
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &[]string{"Please provide a question!"}[0],
+		})
+		return
+	}
+
+	query := options[0].StringValue()
+	if query == "" {
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &[]string{"Hi! How can I help you?"}[0],
+		})
+		return
+	}
+
+	// Get guild info
+	guild, err := s.Guild(i.GuildID)
+	if err != nil {
+		log.Printf("Error getting guild: %v", err)
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &[]string{"Sorry, I encountered an error."}[0],
+		})
+		return
+	}
+
+	// Get relevant context using RAG
+	context, err := h.rag.SearchRelevantContext(query, i.GuildID, 5)
+	if err != nil {
+		log.Printf("Error getting context: %v", err)
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &[]string{"Sorry, I encountered an error while searching for context."}[0],
+		})
+		return
+	}
+
+	// Generate AI response
+	response, err := h.rag.GenerateResponse(query, context, i.Member.User.Username, guild.Name)
+	if err != nil {
+		log.Printf("Error generating response: %v", err)
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &[]string{"Sorry, I encountered an error while generating a response."}[0],
+		})
+		return
+	}
+
+	// Send response
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &response,
+	})
+
+	// Log interaction
+	interaction := &models.BotInteraction{
+		UserID:    i.Member.User.ID,
+		Username:  i.Member.User.Username,
+		Query:     query,
+		Response:  response,
+		ChannelID: i.ChannelID,
+		GuildID:   i.GuildID,
 		Timestamp: time.Now(),
 	}
 

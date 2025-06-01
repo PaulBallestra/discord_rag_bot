@@ -302,51 +302,47 @@ func (vm *VoiceManager) listenForVoice(vc *VoiceConnection) {
 	}
 }
 
-// Replace the processVoicePacket function in voice.go
 func (vm *VoiceManager) processVoicePacket(vc *VoiceConnection, packet *discordgo.Packet) {
 	// Skip empty or invalid packets
 	if packet == nil || packet.Opus == nil || len(packet.Opus) == 0 {
 		return
 	}
 
-	// Skip packets that are too small (likely invalid)
-	if len(packet.Opus) < 10 {
+	// Skip packets from the bot itself
+	if packet.SSRC == 0 {
 		return
 	}
 
-	vc.mu.Lock()
-	defer vc.mu.Unlock()
-
-	// Try to decode Opus to PCM - handle errors gracefully
-	pcm, err := vc.decoder.Decode(packet.Opus, 960, false)
+	// Decode opus data to PCM
+	pcmData, err := vc.decoder.Decode(packet.Opus, 960, false)
 	if err != nil {
-		// Don't log every invalid packet, just skip them
 		if !strings.Contains(err.Error(), "invalid packet") {
 			log.Printf("Error decoding opus: %v", err)
 		}
 		return
 	}
 
-	// Skip if PCM data is empty
-	if len(pcm) == 0 {
+	if len(pcmData) == 0 {
 		return
 	}
 
-	// Convert to bytes and write to buffer
-	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.LittleEndian, pcm); err != nil {
-		log.Printf("Error writing PCM data: %v", err)
-		return
+	// Convert int16 samples to bytes
+	pcmBytes := make([]byte, len(pcmData)*2)
+	for i, sample := range pcmData {
+		binary.LittleEndian.PutUint16(pcmBytes[i*2:], uint16(sample))
 	}
 
-	vc.AudioBuffer.Write(buf.Bytes())
+	// Buffer the audio data
+	vc.mu.Lock()
+	vc.AudioBuffer.Write(pcmBytes)
 	vc.LastActivity = time.Now()
 
-	// If we're not currently recording, start recording
+	// Start recording if not already recording
 	if !vc.IsRecording {
 		vc.IsRecording = true
 		go vm.handleVoiceRecording(vc)
 	}
+	vc.mu.Unlock()
 }
 
 func (vm *VoiceManager) handleVoiceRecording(vc *VoiceConnection) {
@@ -407,73 +403,87 @@ func (vm *VoiceManager) processRecordedAudio(vc *VoiceConnection) {
 	vc.IsRecording = false
 	vc.mu.Unlock()
 
-	if len(audioData) < 1000 {
+	log.Printf("Processing recorded audio (%d bytes) from guild %s", len(audioData), vc.GuildID)
+
+	if len(audioData) < 16000 {
+		log.Printf("Audio data too small (%d bytes), skipping", len(audioData))
 		return
 	}
 
-	log.Printf("Processing recorded audio (%d bytes) from guild %s", len(audioData), vc.GuildID)
-	go vm.processVoiceToAI(vc, audioData)
-}
-
-func (vm *VoiceManager) processVoiceToAI(vc *VoiceConnection, pcmData []byte) {
-	// Convert PCM to WAV format
-	wavData, err := vm.pcmToWav(pcmData)
+	// Convert PCM to WAV
+	wavData, err := vm.pcmToWav(audioData)
 	if err != nil {
 		log.Printf("Error converting PCM to WAV: %v", err)
 		return
 	}
 
-	// Send to speech-to-text
+	// Transcribe audio to text
 	text, err := vm.handler.rag.AI.SpeechToText(bytes.NewReader(wavData))
 	if err != nil {
 		log.Printf("Error in speech-to-text: %v", err)
 		return
 	}
 
-	text = strings.TrimSpace(text)
-	if len(text) < 3 {
-		log.Println("Text too short, ignoring")
+	if strings.TrimSpace(text) == "" {
+		log.Printf("Empty transcription, skipping")
 		return
 	}
 
-	log.Printf("Transcribed text: '%s'", text)
+	log.Printf("Transcribed text from guild %s: %s", vc.GuildID, text)
 
-	// Get relevant context for RAG
+	// Get guild info
+	guild, err := vm.handler.session.Guild(vc.GuildID)
+	if err != nil {
+		log.Printf("Error getting guild info: %v", err)
+		return
+	}
+
+	// Get channel info
+	channel, err := vm.handler.session.Channel(vc.ChannelID)
+	if err != nil {
+		log.Printf("Error getting channel info: %v", err)
+		return
+	}
+
+	// Get relevant context using RAG
 	context, err := vm.handler.rag.SearchRelevantContext(text, vc.GuildID, 5)
 	if err != nil {
 		log.Printf("Error getting context: %v", err)
-		context = "" // Continue without context
+		return
 	}
 
 	// Generate AI response
-	response, err := vm.handler.rag.GenerateResponse(text, context, "User", "Voice Channel")
+	response, err := vm.handler.rag.GenerateResponse(text, context, "Voice User", guild.Name)
 	if err != nil {
 		log.Printf("Error generating response: %v", err)
 		return
 	}
 
-	log.Printf("Generated response: '%s'", response)
+	// Send text response to the channel
+	go func() {
+		_, err := vm.handler.session.ChannelMessageSend(channel.ID, "🎤 **Voice Message:** "+text+"\n\n"+response)
+		if err != nil {
+			log.Printf("Error sending message: %v", err)
+		}
+	}()
 
-	// Log the interaction
-	vm.handler.logVoiceInteraction(vc.GuildID, vc.ChannelID, vc.UserId, "VoiceUser", text, response)
+	// Generate and play TTS response
+	go func() {
+		ttsAudio, err := vm.handler.rag.AI.TextToSpeech(response)
+		if err != nil {
+			log.Printf("Error generating TTS: %v", err)
+			return
+		}
 
-	// Generate TTS audio
-	ttsAudio, err := vm.handler.rag.AI.TextToSpeech(response)
-	if err != nil {
-		log.Printf("Error generating TTS audio: %v", err)
-		return
-	}
+		if err := vm.SendAudio(vc, ttsAudio); err != nil {
+			log.Printf("Error playing TTS audio: %v", err)
+		}
+	}()
 
-	// Send the TTS audio to the voice channel
-	log.Printf("Sending audio response to voice channel")
-	if err := vm.SendAudio(vc, ttsAudio); err != nil {
-		log.Printf("Error sending audio: %v", err)
-	} else {
-		log.Printf("Successfully sent audio response")
-	}
+	// Log the voice interaction
+	vm.handler.logVoiceInteraction(vc.GuildID, channel.ID, vc.UserId, "Voice User", text, response)
 }
 
-// Replace the pcmToWav function in voice.go
 func (vm *VoiceManager) pcmToWav(pcmData []byte) ([]byte, error) {
 	// Create temporary files
 	pcmFile, err := os.CreateTemp("", "voice-*.pcm")
@@ -516,11 +526,16 @@ func (vm *VoiceManager) pcmToWav(pcmData []byte) ([]byte, error) {
 	}
 
 	// Read the WAV file
-	wavData, err := os.ReadFile(wavFile.Name())
+	wavFile, err = os.Open(wavFile.Name())
 	if err != nil {
-		return nil, fmt.Errorf("failed to read WAV file: %v", err)
+		return nil, fmt.Errorf("failed to open WAV file: %v", err)
+	}
+	defer wavFile.Close()
+
+	wavData, err := io.ReadAll(wavFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read WAV data: %v", err)
 	}
 
-	log.Printf("Generated WAV file: %d bytes", len(wavData))
 	return wavData, nil
 }
