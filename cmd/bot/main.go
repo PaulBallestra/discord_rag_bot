@@ -55,7 +55,7 @@ func main() {
 	// Add event handlers
 	discord.AddHandler(botHandler.OnMessageCreate)
 
-	// Set intents (add voice state intent)
+	// Set intents (add voice state intent and interaction intent)
 	discord.Identify.Intents = discordgo.IntentsGuildMessages |
 		discordgo.IntentsDirectMessages |
 		discordgo.IntentsGuildVoiceStates
@@ -66,11 +66,17 @@ func main() {
 	}
 	defer discord.Close()
 
+	// Register slash commands after connection is established
+	if err := botHandler.RegisterCommands(); err != nil {
+		log.Printf("Warning: Failed to register slash commands: %v", err)
+	}
+
 	log.Println("🎤 Discord Voice RAG Bot is running!")
 	log.Println("Commands:")
 	log.Println("  /join - Join your voice channel")
 	log.Println("  /leave - Leave voice channel")
-	log.Println("  @bot <message> - Text chat with AI")
+	log.Println("  /ai <question> - Text chat with AI")
+	log.Println("  @bot <message> - Also works for text chat")
 	log.Println("  Just talk when bot is in voice channel!")
 
 	// Wait for interrupt signal
