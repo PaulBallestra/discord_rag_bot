@@ -224,9 +224,16 @@ func (h *BotHandler) storeMessage(m *discordgo.MessageCreate) {
 }
 
 func (h *BotHandler) handleAIQuery(s *discordgo.Session, m *discordgo.MessageCreate) {
-	// Clean the query
-	query := strings.ReplaceAll(m.Content, "<@"+h.botID+">", "")
+	// Clean the query - extract just the actual question from the message
+	query := m.Content
+
+	// Remove the bot mention
+	query = strings.ReplaceAll(query, "<@"+h.botID+">", "")
+
+	// Remove the /ai prefix if present
 	query = strings.ReplaceAll(query, "/ai ", "")
+
+	// Trim any extra whitespace
 	query = strings.TrimSpace(query)
 
 	if query == "" {
@@ -260,16 +267,16 @@ func (h *BotHandler) handleAIQuery(s *discordgo.Session, m *discordgo.MessageCre
 		return
 	}
 
+	// Send text response (only once)
+	s.ChannelMessageSend(m.ChannelID, response)
+
 	// Check if we have a voice connection for this guild
 	h.voiceManager.mu.RLock()
 	vc, hasVoiceConnection := h.voiceManager.connections[m.GuildID]
 	h.voiceManager.mu.RUnlock()
 
-	// Send response based on connection type
+	// Generate and send voice response if in a voice channel
 	if hasVoiceConnection && vc != nil {
-		// Send text response first
-		s.ChannelMessageSend(m.ChannelID, response)
-
 		// Generate TTS audio and send to voice channel
 		ttsAudio, err := h.rag.AI.TextToSpeech(response)
 		if err != nil {
@@ -282,9 +289,6 @@ func (h *BotHandler) handleAIQuery(s *discordgo.Session, m *discordgo.MessageCre
 				}
 			}()
 		}
-	} else {
-		// Just send text response
-		s.ChannelMessageSend(m.ChannelID, response)
 	}
 
 	// Log interaction
@@ -432,10 +436,31 @@ func (h *BotHandler) handleAIInteraction(s *discordgo.Session, i *discordgo.Inte
 		return
 	}
 
-	// Send response
+	// Send text response
 	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 		Content: &response,
 	})
+
+	// Check if we have a voice connection for this guild
+	h.voiceManager.mu.RLock()
+	vc, hasVoiceConnection := h.voiceManager.connections[i.GuildID]
+	h.voiceManager.mu.RUnlock()
+
+	// Generate and send voice response if in a voice channel
+	if hasVoiceConnection && vc != nil {
+		// Generate TTS audio and send to voice channel
+		ttsAudio, err := h.rag.AI.TextToSpeech(response)
+		if err != nil {
+			log.Printf("Error generating TTS audio: %v", err)
+		} else {
+			// Send the TTS audio to the voice channel in a goroutine
+			go func() {
+				if err := h.voiceManager.SendAudio(vc, ttsAudio); err != nil {
+					log.Printf("Error sending audio: %v", err)
+				}
+			}()
+		}
+	}
 
 	// Log interaction
 	interaction := &models.BotInteraction{

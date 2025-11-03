@@ -63,10 +63,22 @@ func (vm *VoiceManager) JoinVoiceChannel(s *discordgo.Session, guildID, channelI
 		time.Sleep(1 * time.Second) // Wait for cleanup
 	}
 
-	// Join voice channel
-	voiceConn, err := s.ChannelVoiceJoin(guildID, channelID, false, false)
+	// Join voice channel with retry logic
+	var voiceConn *discordgo.VoiceConnection
+	var err error
+
+	// Try up to 3 times to join the voice channel
+	for attempts := 0; attempts < 3; attempts++ {
+		voiceConn, err = s.ChannelVoiceJoin(guildID, channelID, false, true) // Set both to true to receive and send audio
+		if err == nil {
+			break
+		}
+		log.Printf("Attempt %d to join voice channel failed: %v", attempts+1, err)
+		time.Sleep(2 * time.Second)
+	}
+
 	if err != nil {
-		return fmt.Errorf("failed to join voice channel: %v", err)
+		return fmt.Errorf("failed to join voice channel after multiple attempts: %v", err)
 	}
 
 	// Wait for the connection to be ready with timeout
@@ -216,6 +228,11 @@ func (vm *VoiceManager) convertToPCM(inputFile, outputFile string) error {
 func (vm *VoiceManager) playPCMFile(vc *VoiceConnection, filename string) error {
 	log.Printf("Playing PCM audio file: %s", filename)
 
+	// First check if connection is still valid
+	if vc.Connection == nil || !vc.Connection.Ready {
+		return fmt.Errorf("voice connection no longer valid")
+	}
+
 	file, err := os.Open(filename)
 	if err != nil {
 		return fmt.Errorf("error opening PCM file: %v", err)
@@ -228,6 +245,9 @@ func (vm *VoiceManager) playPCMFile(vc *VoiceConnection, filename string) error 
 
 	// Read and encode PCM data in chunks
 	buffer := make([]byte, 3840) // 960 samples * 2 channels * 2 bytes per sample
+	framesSent := 0
+	timeoutCount := 0
+	maxTimeouts := 10 // Maximum consecutive timeouts before giving up
 
 	for {
 		select {
@@ -261,27 +281,61 @@ func (vm *VoiceManager) playPCMFile(vc *VoiceConnection, filename string) error 
 			continue
 		}
 
-		// Send to Discord
+		// Send to Discord with improved timeout handling
 		select {
 		case vc.Connection.OpusSend <- opusData:
+			framesSent++
+			timeoutCount = 0 // Reset timeout counter on success
 		case <-time.After(100 * time.Millisecond):
-			log.Printf("Timeout sending Opus frame")
+			timeoutCount++
+			if timeoutCount >= maxTimeouts {
+				log.Printf("Too many consecutive timeouts (%d), stopping playback", timeoutCount)
+				return fmt.Errorf("too many timeouts sending audio")
+			}
+			log.Printf("Timeout sending Opus frame (%d/%d)", timeoutCount, maxTimeouts)
 		case <-vc.ctx.Done():
 			return fmt.Errorf("playback cancelled")
 		}
+
+		// Add a small delay between frames to prevent flooding
+		time.Sleep(5 * time.Millisecond)
 	}
 
-	log.Printf("Finished playing audio")
+	log.Printf("Finished playing audio, sent %d frames", framesSent)
 	return nil
 }
 
 func (vm *VoiceManager) listenForVoice(vc *VoiceConnection) {
 	log.Printf("Started listening for voice in guild %s", vc.GuildID)
 
+	reconnectAttempts := 0
+	maxReconnectAttempts := 3
+
 	for {
 		select {
-		case packet := <-vc.Connection.OpusRecv:
-			if packet != nil && packet.Opus != nil {
+		case packet, ok := <-vc.Connection.OpusRecv:
+			if !ok {
+				// Channel closed, try to reconnect
+				reconnectAttempts++
+				if reconnectAttempts <= maxReconnectAttempts {
+					log.Printf("Voice receive channel closed, attempting reconnection %d/%d",
+						reconnectAttempts, maxReconnectAttempts)
+
+					// Wait a bit before trying to reconnect
+					time.Sleep(2 * time.Second)
+
+					// Attempt to reconnect
+					if err := vm.reconnectVoice(vc); err != nil {
+						log.Printf("Failed to reconnect: %v", err)
+						continue
+					}
+				} else {
+					log.Printf("Maximum reconnection attempts reached, giving up")
+					vm.LeaveVoiceChannel(vc.GuildID)
+					return
+				}
+			} else if packet != nil && packet.Opus != nil {
+				reconnectAttempts = 0 // Reset counter on successful packet
 				vm.processVoicePacket(vc, packet)
 			}
 		case <-vc.ctx.Done():
@@ -538,4 +592,56 @@ func (vm *VoiceManager) pcmToWav(pcmData []byte) ([]byte, error) {
 	}
 
 	return wavData, nil
+}
+
+// New helper method to reconnect a voice connection
+func (vm *VoiceManager) reconnectVoice(vc *VoiceConnection) error {
+	// Don't attempt if context is already cancelled
+	select {
+	case <-vc.ctx.Done():
+		return fmt.Errorf("context already cancelled")
+	default:
+	}
+
+	// Remember the original details
+	guildID := vc.GuildID
+	channelID := vc.ChannelID
+	// userID not needed for reconnection
+
+	// First clean up the old connection
+	if vc.Connection != nil {
+		vc.Connection.Disconnect()
+	}
+
+	// Create a new voice connection
+	voiceConn, err := vm.handler.session.ChannelVoiceJoin(guildID, channelID, false, false)
+	if err != nil {
+		return fmt.Errorf("failed to rejoin voice channel: %v", err)
+	}
+
+	// Wait for the connection to be ready
+	timeout := time.After(5 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			voiceConn.Disconnect()
+			return fmt.Errorf("reconnection timeout")
+		case <-ticker.C:
+			if voiceConn.Ready {
+				log.Printf("Voice connection reconnected for guild %s", guildID)
+				// Update the connection
+				vc.Connection = voiceConn
+				vc.LastActivity = time.Now()
+				return nil
+			}
+		case <-vc.ctx.Done():
+			if voiceConn != nil {
+				voiceConn.Disconnect()
+			}
+			return fmt.Errorf("context cancelled during reconnection")
+		}
+	}
 }
